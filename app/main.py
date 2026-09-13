@@ -1,12 +1,12 @@
-import os
 from pathlib import Path
 
-import streamlit as st
-from dotenv import load_dotenv
-from google import genai
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from pydantic import BaseModel
 
 from app.ingestion import load_documents, split_documents
 from app.vectorstore import embeddings, VECTORSTORE_DIR
+from app.chatbot import ask_campus_ai
+
 from langchain_community.vectorstores import FAISS
 
 
@@ -14,230 +14,319 @@ from langchain_community.vectorstores import FAISS
 # Configuration
 # ==========================================
 
-load_dotenv()
-
 UPLOAD_DIR = Path("data/uploads")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-VECTORSTORE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ==========================================
-# Gemini Client
-# ==========================================
-
-api_key = os.getenv("GEMINI_API_KEY")
-
-if not api_key:
-    st.error("GEMINI_API_KEY is not configured in the .env file.")
-    st.stop()
-
-client = genai.Client(
-    api_key=api_key
+UPLOAD_DIR.mkdir(
+    parents=True,
+    exist_ok=True
 )
 
-MODEL_NAME = "gemini-3.6-flash"
-
-
-# ==========================================
-# Streamlit Configuration
-# ==========================================
-
-st.set_page_config(
-    page_title="CampusAI",
-    page_icon="🎓",
-    layout="wide"
+VECTORSTORE_DIR.mkdir(
+    parents=True,
+    exist_ok=True
 )
 
 
 # ==========================================
-# Header
+# FastAPI Application
 # ==========================================
 
-st.title("🎓 CampusAI")
-st.write("AI assistant for college documents")
-
-
-# ==========================================
-# Sidebar - Upload Documents
-# ==========================================
-
-st.sidebar.header("📄 Upload Documents")
-
-uploaded_files = st.sidebar.file_uploader(
-    "Upload PDF files",
-    type=["pdf"],
-    accept_multiple_files=True
+app = FastAPI(
+    title="CampusAI API",
+    description="RAG backend for the CampusAI college assistant",
+    version="1.0.0"
 )
 
 
-if uploaded_files:
+# ==========================================
+# Request Schema
+# ==========================================
 
-    for uploaded_file in uploaded_files:
+class ChatRequest(BaseModel):
+    question: str
 
-        file_path = UPLOAD_DIR / uploaded_file.name
 
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+# ==========================================
+# Root Endpoint
+# ==========================================
 
-    st.sidebar.success(
-        f"{len(uploaded_files)} document(s) uploaded."
+@app.get("/")
+def root():
+
+    return {
+        "message": "CampusAI API is running",
+        "status": "success"
+    }
+
+
+# ==========================================
+# Health Check
+# ==========================================
+
+@app.get("/api/health")
+def health_check():
+
+    return {
+        "status": "healthy"
+    }
+
+
+# ==========================================
+# Admin - Upload PDF
+# ==========================================
+
+@app.post("/api/admin/upload")
+async def upload_pdf(
+    file: UploadFile = File(...)
+):
+
+    # --------------------------------------
+    # Validate File Type
+    # --------------------------------------
+
+    if not file.filename:
+
+        raise HTTPException(
+            status_code=400,
+            detail="No filename provided."
+        )
+
+
+    if not file.filename.lower().endswith(".pdf"):
+
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are allowed."
+        )
+
+
+    # --------------------------------------
+    # Save File
+    # --------------------------------------
+
+    file_path = (
+        UPLOAD_DIR /
+        Path(file.filename).name
     )
 
 
+    try:
+
+        contents = await file.read()
+
+        with open(
+            file_path,
+            "wb"
+        ) as output_file:
+
+            output_file.write(
+                contents
+            )
+
+
+    except Exception as error:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save PDF: {error}"
+        )
+
+
+    return {
+
+        "message":
+            "PDF uploaded successfully",
+
+        "filename":
+            file_path.name,
+
+        "path":
+            str(file_path)
+    }
+
+
 # ==========================================
-# Sidebar - Process Documents
+# Admin - Process Documents
 # ==========================================
 
-st.sidebar.header("⚙️ Document Processing")
+@app.post("/api/admin/process")
+def process_documents():
 
-if st.sidebar.button("🔄 Process Documents"):
+    try:
 
-    with st.spinner("Processing documents..."):
+        # ----------------------------------
+        # Load PDFs
+        # ----------------------------------
 
         documents = load_documents()
 
+
         if not documents:
 
-            st.error("No PDF documents found.")
-
-        else:
-
-            chunks = split_documents(documents)
-
-            vectorstore = FAISS.from_documents(
-                chunks,
-                embeddings
-            )
-
-            vectorstore.save_local(
-                str(VECTORSTORE_DIR)
-            )
-
-            st.success(
-                f"✅ Processed {len(chunks)} chunks."
+            raise HTTPException(
+                status_code=404,
+                detail="No PDF documents found."
             )
 
 
-# ==========================================
-# Chat Input
-# ==========================================
+        # ----------------------------------
+        # Split Documents
+        # ----------------------------------
 
-question = st.chat_input(
-    "Ask something about your college..."
-)
-
-
-# ==========================================
-# Question Processing
-# ==========================================
-
-if question:
-
-    # Check whether vectorstore exists
-    index_file = VECTORSTORE_DIR / "index.faiss"
-
-    if not index_file.exists():
-
-        st.error(
-            "Please upload and process documents first."
-        )
-
-        st.stop()
-
-
-    # ======================================
-    # Retrieve Documents
-    # ======================================
-
-    with st.spinner("🔎 Searching documents..."):
-
-        vectorstore = FAISS.load_local(
-            str(VECTORSTORE_DIR),
-            embeddings,
-            allow_dangerous_deserialization=True
-        )
-
-        docs = vectorstore.similarity_search(
-            question,
-            k=3
+        chunks = split_documents(
+            documents
         )
 
 
-    # ======================================
-    # Build Context
-    # ======================================
+        if not chunks:
 
-    context = "\n\n".join(
-        f"Source: {doc.metadata.get('source', 'Unknown')}\n"
-        f"Page: {doc.metadata.get('page', 0) + 1}\n"
-        f"{doc.page_content}"
-        for doc in docs
+            raise HTTPException(
+                status_code=400,
+                detail="No text chunks were created."
+            )
+
+
+        # ----------------------------------
+        # Create FAISS
+        # ----------------------------------
+
+        vectorstore = FAISS.from_documents(
+            chunks,
+            embeddings
+        )
+
+
+        # ----------------------------------
+        # Save FAISS
+        # ----------------------------------
+
+        vectorstore.save_local(
+            str(VECTORSTORE_DIR)
+        )
+
+
+        return {
+
+            "message":
+                "Documents processed successfully",
+
+            "documents":
+                len(documents),
+
+            "chunks":
+                len(chunks)
+        }
+
+
+    except HTTPException:
+
+        raise
+
+
+    except Exception as error:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Document processing failed: {error}"
+        )
+
+
+# ==========================================
+# Admin - List PDFs
+# ==========================================
+
+@app.get("/api/admin/documents")
+def list_documents():
+
+    pdf_files = list(
+        UPLOAD_DIR.glob("*.pdf")
     )
 
 
-    # ======================================
-    # Gemini Prompt
-    # ======================================
+    documents = []
 
-    prompt = f"""
-You are CampusAI, a college knowledge assistant.
+    for pdf_file in pdf_files:
 
-Answer the user's question using ONLY the provided context.
+        documents.append({
 
-Rules:
-- Do not use outside knowledge.
-- Do not invent information.
-- If the answer is not available in the context, say:
-  "I don't know based on the uploaded documents."
-- Give a clear and concise answer.
-- Use bullet points when appropriate.
+            "filename":
+                pdf_file.name,
 
-Context:
-{context}
-
-Question:
-{question}
-"""
+            "size_bytes":
+                pdf_file.stat().st_size
+        })
 
 
-    # ======================================
-    # Generate Answer
-    # ======================================
+    return {
 
-    with st.spinner("🤖 CampusAI is thinking..."):
+        "count":
+            len(documents),
 
-        interaction = client.interactions.create(
-            model=MODEL_NAME,
-            input=prompt
+        "documents":
+            documents
+    }
+
+
+# ==========================================
+# Student - Chat
+# ==========================================
+
+@app.post("/api/chat")
+def chat(
+    request: ChatRequest
+):
+
+    question = request.question.strip()
+
+
+    if not question:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty."
         )
 
-        answer = interaction.output_text
+
+    # --------------------------------------
+    # Check Vector Store
+    # --------------------------------------
+
+    index_file = (
+        VECTORSTORE_DIR /
+        "index.faiss"
+    )
 
 
-    # ======================================
-    # Display User Question
-    # ======================================
+    if not index_file.exists():
 
-    st.chat_message("user").write(question)
-
-
-    # ======================================
-    # Display Assistant Answer
-    # ======================================
-
-    with st.chat_message("assistant"):
-
-        st.write(answer)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Knowledge base is not ready. "
+                "Please process documents first."
+            )
+        )
 
 
-        # ==================================
-        # Sources
-        # ==================================
+    # --------------------------------------
+    # RAG
+    # --------------------------------------
 
-        st.markdown("### 📚 Sources")
+    try:
+
+        answer, docs = ask_campus_ai(
+            question
+        )
+
+
+        # ------------------------------
+        # Build Sources
+        # ------------------------------
+
+        sources = []
 
         displayed_sources = set()
+
 
         for doc in docs:
 
@@ -248,16 +337,54 @@ Question:
                 )
             ).name
 
+
             page = (
-                doc.metadata.get("page", 0) + 1
+                doc.metadata.get(
+                    "page",
+                    0
+                ) + 1
             )
 
-            source_key = (source, page)
+
+            source_key = (
+                source,
+                page
+            )
+
 
             if source_key not in displayed_sources:
 
-                displayed_sources.add(source_key)
-
-                st.write(
-                    f"📄 {source} — Page {page}"
+                displayed_sources.add(
+                    source_key
                 )
+
+
+                sources.append({
+
+                    "file":
+                        source,
+
+                    "page":
+                        page
+                })
+
+
+        return {
+
+            "question":
+                question,
+
+            "answer":
+                answer,
+
+            "sources":
+                sources
+        }
+
+
+    except Exception as error:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"RAG processing failed: {error}"
+        )
