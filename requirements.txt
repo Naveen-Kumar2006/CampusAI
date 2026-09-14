@@ -14,3 +14,7 @@ google-genai
 
 
 requests
+
+fastapi
+uvicorn
+python-multipart
