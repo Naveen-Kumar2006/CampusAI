@@ -1,0 +1,680 @@
+"""Human in the loop middleware."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast
+
+from langchain_core.messages import AIMessage, ToolCall, ToolMessage
+from langgraph.config import get_config
+from langgraph.prebuilt.tool_node import ToolRuntime
+from langgraph.types import Command, interrupt
+from typing_extensions import NotRequired, TypedDict
+
+from langchain.agents.middleware.types import (
+    AgentMiddleware,
+    AgentState,
+    ContextT,
+    PrivateStateAttr,
+    ResponseT,
+    StateT,
+    ToolCallRequest,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from langgraph.runtime import Runtime
+
+
+_EDITED_TOOL_CALLS_KEY = "hitl_edited_tool_calls"
+"""State key mapping tool call ID to the reviewer's replacement for it."""
+
+_EDIT_NOTICE = (
+    "Note: a human reviewer replaced this tool call before it ran. The call recorded in "
+    "your message is the one you produced, not the one that executed. This was "
+    "intentional and authorized. Do not re-issue your original call."
+)
+"""Default text prepended to the result of a tool call a reviewer edited."""
+
+
+class Action(TypedDict):
+    """Represents an action with a name and args."""
+
+    name: str
+    """The type or name of action being requested (e.g., `'add_numbers'`)."""
+
+    args: dict[str, Any]
+    """Key-value pairs of args needed for the action (e.g., `{"a": 1, "b": 2}`)."""
+
+
+class ActionRequest(TypedDict):
+    """Represents an action request with a name, args, and description."""
+
+    name: str
+    """The name of the action being requested."""
+
+    args: dict[str, Any]
+    """Key-value pairs of args needed for the action (e.g., `{"a": 1, "b": 2}`)."""
+
+    description: NotRequired[str]
+    """The description of the action to be reviewed."""
+
+
+DecisionType = Literal["approve", "edit", "reject", "respond"]
+
+
+class ReviewConfig(TypedDict):
+    """Policy for reviewing a HITL request."""
+
+    action_name: str
+    """Name of the action associated with this review configuration."""
+
+    allowed_decisions: list[DecisionType]
+    """The decisions that are allowed for this request."""
+
+    args_schema: NotRequired[dict[str, Any]]
+    """JSON schema for the args associated with the action, if edits are allowed."""
+
+
+class HITLRequest(TypedDict):
+    """Request for human feedback on a sequence of actions requested by a model."""
+
+    action_requests: list[ActionRequest]
+    """A list of agent actions for human review."""
+
+    review_configs: list[ReviewConfig]
+    """Review configuration for all possible actions."""
+
+
+class ApproveDecision(TypedDict):
+    """Response when a human approves the action."""
+
+    type: Literal["approve"]
+    """The type of response when a human approves the action."""
+
+
+class EditDecision(TypedDict):
+    """Response when a human edits the action."""
+
+    type: Literal["edit"]
+    """The type of response when a human edits the action."""
+
+    edited_action: Action
+    """Edited action for the agent to perform.
+
+    Ex: for a tool call, a human reviewer can edit the tool name and args.
+    """
+
+
+class RejectDecision(TypedDict):
+    """Response when a human rejects the action."""
+
+    type: Literal["reject"]
+    """The type of response when a human rejects the action."""
+
+    message: NotRequired[str]
+    """The human-provided reason for rejecting the action.
+
+    The reason is framed as a user rejection when sent to the model. If omitted,
+    the model is told that the tool was not executed and should not retry the same
+    tool call unless the user asks for it.
+    """
+
+
+class RespondDecision(TypedDict):
+    """Response when a human answers on behalf of the tool, skipping execution.
+
+    Used for "ask user" style tools whose real implementation is the human's
+    response. The tool is not executed; instead, a synthetic `ToolMessage` with
+    `status="success"` and the provided `message` is returned to the model.
+    """
+
+    type: Literal["respond"]
+    """The type of response when a human responds on behalf of the tool."""
+
+    message: str
+    """Content of the synthetic `ToolMessage` returned to the model."""
+
+
+Decision = ApproveDecision | EditDecision | RejectDecision | RespondDecision
+
+
+class HITLResponse(TypedDict):
+    """Response payload for a HITLRequest."""
+
+    decisions: list[Decision]
+    """The decisions made by the human."""
+
+
+class _DescriptionFactory(Protocol):
+    """Callable that generates a description for a tool call."""
+
+    def __call__(
+        self, tool_call: ToolCall, state: AgentState[Any], runtime: Runtime[ContextT]
+    ) -> str:
+        """Generate a description for a tool call."""
+        ...
+
+
+class InterruptOnConfig(TypedDict):
+    """Configuration for an action requiring human in the loop.
+
+    This is the configuration format used in the `HumanInTheLoopMiddleware.__init__`
+    method.
+    """
+
+    allowed_decisions: list[DecisionType]
+    """The decisions that are allowed for this action."""
+
+    description: NotRequired[str | _DescriptionFactory]
+    """The description attached to the request for human input.
+
+    Can be either:
+
+    - A static string describing the approval request
+    - A callable that dynamically generates the description based on agent state,
+        runtime, and tool call information
+
+    Example:
+        ```python
+        # Static string description
+        config = InterruptOnConfig(
+            allowed_decisions=["approve", "reject"],
+            description="Please review this tool execution"
+        )
+
+        # Dynamic callable description
+        def format_tool_description(
+            tool_call: ToolCall,
+            state: AgentState,
+            runtime: Runtime[ContextT]
+        ) -> str:
+            import json
+            return (
+                f"Tool: {tool_call['name']}\\n"
+                f"Arguments:\\n{json.dumps(tool_call['args'], indent=2)}"
+            )
+
+        config = InterruptOnConfig(
+            allowed_decisions=["approve", "edit", "reject"],
+            description=format_tool_description
+        )
+        ```
+    """
+    args_schema: NotRequired[dict[str, Any]]
+    """JSON schema for the args associated with the action, if edits are allowed."""
+
+    when: NotRequired[Callable[[ToolCallRequest], bool]]
+    """Optional predicate controlling whether to interrupt for a given tool call.
+
+    Receives a `ToolCallRequest` and returns `True` to interrupt or `False` to
+    auto-approve. The predicate is called during `after_model` before the tool
+    call is added to the batched human-in-the-loop request.
+
+    The request is constructed with `tool=None` and a new `ToolRuntime`. The
+    `ToolRuntime` copies `context`, `store`, `stream_writer`, `execution_info`,
+    and `server_info` from the node-level `Runtime`, while `tool_call_id` is
+    populated from the current tool call. The `tools` argument is not supplied,
+    so it uses its default empty list.
+
+    Example:
+        ```python
+        # Only interrupt delete_file calls targeting /etc
+        config = InterruptOnConfig(
+            allowed_decisions=["approve", "reject"],
+            when=lambda req: req.tool_call["args"].get("path", "").startswith("/etc"),
+        )
+        ```
+    """
+
+
+class _HumanInTheLoopState(AgentState[ResponseT]):
+    """State schema for `HumanInTheLoopMiddleware`."""
+
+    hitl_edited_tool_calls: NotRequired[Annotated[dict[str, Action], PrivateStateAttr]]
+    """Track tool call edits from `after_model`, so they can be used by `wrap_tool_call`."""
+
+
+class HumanInTheLoopMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
+    """Human in the loop middleware."""
+
+    state_schema = _HumanInTheLoopState  # type: ignore[assignment]
+
+    def __init__(
+        self,
+        interrupt_on: dict[str, bool | InterruptOnConfig],
+        *,
+        description_prefix: str = "Tool execution requires approval",
+        edit_notice: str | None = _EDIT_NOTICE,
+    ) -> None:
+        """Initialize the human in the loop middleware.
+
+        Args:
+            interrupt_on: Mapping of tool name to allowed actions.
+
+                If a tool doesn't have an entry, it's auto-approved by default.
+
+                * `True` indicates all decisions are allowed: approve, edit, reject,
+                    and respond.
+                * `False` indicates that the tool is auto-approved.
+                * `InterruptOnConfig` indicates the specific decisions allowed for this
+                    tool.
+
+                    The `InterruptOnConfig` can include a `description` field (`str` or
+                    `Callable`) for custom formatting of the interrupt description.
+
+                    A `when` predicate can also be provided to dynamically control
+                    whether a tool call triggers an interrupt.
+            description_prefix: The prefix to use when constructing action requests.
+
+                This is used to provide context about the tool call and the action being
+                requested.
+
+                Not used if a tool has a `description` in its `InterruptOnConfig`.
+            edit_notice: Text prepended to the result of a tool call a reviewer replaced
+                via an `edit` decision. Pass `None` to add nothing.
+
+        Raises:
+            ValueError: If a tool's `InterruptOnConfig` does not have a non-empty
+                `allowed_decisions` list (e.g. a misspelled key or an empty list).
+                An interrupt config without decisions would otherwise be silently
+                dropped, disabling the approval gate for that tool.
+        """
+        super().__init__()
+        self.edit_notice = edit_notice
+        resolved_configs: dict[str, InterruptOnConfig] = {}
+        for tool_name, tool_config in interrupt_on.items():
+            if isinstance(tool_config, bool):
+                if tool_config is True:
+                    resolved_configs[tool_name] = InterruptOnConfig(
+                        allowed_decisions=["approve", "edit", "reject", "respond"]
+                    )
+            elif tool_config.get("allowed_decisions"):
+                resolved_configs[tool_name] = tool_config
+            else:
+                msg = (
+                    f"Invalid `interrupt_on` config for tool '{tool_name}': "
+                    "`allowed_decisions` must be a non-empty list of decision types "
+                    "(e.g. ['approve', 'reject']). Got config with keys "
+                    f"{sorted(tool_config.keys())} and "
+                    f"allowed_decisions={tool_config.get('allowed_decisions')!r}."
+                )
+                raise ValueError(msg)
+        self.interrupt_on = resolved_configs
+        self.description_prefix = description_prefix
+
+    def _create_action_and_config(
+        self,
+        tool_call: ToolCall,
+        config: InterruptOnConfig,
+        state: AgentState[Any],
+        runtime: Runtime[ContextT],
+    ) -> tuple[ActionRequest, ReviewConfig]:
+        """Create an ActionRequest and ReviewConfig for a tool call."""
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+
+        # Generate description using the description field (str or callable)
+        description_value = config.get("description")
+        if callable(description_value):
+            description = description_value(tool_call, state, runtime)
+        elif description_value is not None:
+            description = description_value
+        else:
+            description = f"{self.description_prefix}\n\nTool: {tool_name}\nArgs: {tool_args}"
+
+        # Create ActionRequest with description
+        action_request = ActionRequest(
+            name=tool_name,
+            args=tool_args,
+            description=description,
+        )
+
+        # Create ReviewConfig
+        # eventually can get tool information and populate args_schema from there
+        review_config = ReviewConfig(
+            action_name=tool_name,
+            allowed_decisions=config["allowed_decisions"],
+        )
+
+        return action_request, review_config
+
+    @staticmethod
+    def _process_decision(
+        decision: Decision,
+        tool_call: ToolCall,
+        config: InterruptOnConfig,
+    ) -> tuple[ToolCall | None, ToolMessage | None]:
+        """Process a single decision and return the revised tool call and optional tool message."""
+        allowed_decisions = config["allowed_decisions"]
+
+        if decision["type"] == "approve" and "approve" in allowed_decisions:
+            return tool_call, None
+        if decision["type"] == "edit" and "edit" in allowed_decisions:
+            # Keep the model's own call in the message; `wrap_tool_call` substitutes the
+            # reviewer's at execution time.
+            return tool_call, None
+        if decision["type"] == "reject" and "reject" in allowed_decisions:
+            reason = decision.get("message")
+            content = (
+                f"User rejected the tool call for `{tool_call['name']}` with reason: {reason}"
+                if reason
+                else (
+                    f"User rejected the tool call for `{tool_call['name']}` with id "
+                    f"{tool_call['id']}. The tool was not executed. Do not retry this tool "
+                    "call unless the user explicitly requests it."
+                )
+            )
+            tool_message = ToolMessage(
+                content=content,
+                name=tool_call["name"],
+                tool_call_id=tool_call["id"],
+                status="error",
+            )
+            return tool_call, tool_message
+        if decision["type"] == "respond" and "respond" in allowed_decisions:
+            # Skip tool execution; the human answers on behalf of the tool.
+            tool_message = ToolMessage(
+                content=decision["message"],
+                name=tool_call["name"],
+                tool_call_id=tool_call["id"],
+                status="success",
+            )
+            return tool_call, tool_message
+        msg = (
+            f"Unexpected human decision: {decision}. "
+            f"Decision type '{decision.get('type')}' "
+            f"is not allowed for tool '{tool_call['name']}'. "
+            f"Expected one of {allowed_decisions} based on the tool's configuration."
+        )
+        raise ValueError(msg)
+
+    def _should_interrupt(
+        self,
+        tool_call: ToolCall,
+        config: InterruptOnConfig,
+        state: AgentState[Any],
+        runtime: Runtime[ContextT],
+    ) -> bool:
+        """Return False if the `when` predicate rejects this tool call, True otherwise."""
+        when = config.get("when")
+        if when is None:
+            return True
+        try:
+            runnable_config = get_config()
+        except RuntimeError:
+            runnable_config = {}
+        tool_runtime = ToolRuntime(
+            state=state,
+            context=runtime.context,
+            config=runnable_config,
+            stream_writer=runtime.stream_writer,
+            tool_call_id=tool_call["id"],
+            store=runtime.store,
+            execution_info=runtime.execution_info,
+            server_info=runtime.server_info,
+        )
+        req = ToolCallRequest(
+            tool_call=tool_call,
+            tool=None,
+            state=state,
+            runtime=tool_runtime,  # type: ignore[arg-type]
+        )
+        return when(req)
+
+    def after_model(
+        self, state: AgentState[Any], runtime: Runtime[ContextT]
+    ) -> dict[str, Any] | None:
+        """Trigger interrupt flows for relevant tool calls after an `AIMessage`.
+
+        Args:
+            state: The current agent state.
+            runtime: The runtime context.
+
+        Returns:
+            Updated message with the revised tool calls.
+
+        Raises:
+            ValueError: If the number of human decisions does not match the number of
+                interrupted tool calls.
+        """
+        messages = state["messages"]
+        if not messages:
+            return None
+
+        last_ai_msg = next((msg for msg in reversed(messages) if isinstance(msg, AIMessage)), None)
+        if not last_ai_msg or not last_ai_msg.tool_calls:
+            return None
+
+        # Create action requests and review configs for tools that need approval
+        action_requests: list[ActionRequest] = []
+        review_configs: list[ReviewConfig] = []
+        interrupt_indices: list[int] = []
+
+        for idx, tool_call in enumerate(last_ai_msg.tool_calls):
+            if (config := self.interrupt_on.get(tool_call["name"])) is not None:
+                if not self._should_interrupt(tool_call, config, state, runtime):
+                    continue
+                action_request, review_config = self._create_action_and_config(
+                    tool_call, config, state, runtime
+                )
+                action_requests.append(action_request)
+                review_configs.append(review_config)
+                interrupt_indices.append(idx)
+
+        # If no interrupts needed, return early, dropping any earlier turn's edits so
+        # they cannot be applied to this turn's tool calls.
+        if not action_requests:
+            if state.get(_EDITED_TOOL_CALLS_KEY):
+                return {_EDITED_TOOL_CALLS_KEY: {}}
+            return None
+
+        # Create single HITLRequest with all actions and configs
+        hitl_request = HITLRequest(
+            action_requests=action_requests,
+            review_configs=review_configs,
+        )
+
+        # Send interrupt and get response
+        decisions = interrupt(hitl_request)["decisions"]
+
+        # Validate that the number of decisions matches the number of interrupt tool calls
+        if (decisions_len := len(decisions)) != (interrupt_count := len(interrupt_indices)):
+            msg = (
+                f"Number of human decisions ({decisions_len}) does not match "
+                f"number of hanging tool calls ({interrupt_count})."
+            )
+            raise ValueError(msg)
+
+        # Process decisions and rebuild tool calls in original order
+        revised_tool_calls: list[ToolCall] = []
+        artificial_tool_messages: list[ToolMessage] = []
+        edited_tool_calls: dict[str, Action] = {}
+        decision_idx = 0
+
+        for idx, tool_call in enumerate(last_ai_msg.tool_calls):
+            if idx in interrupt_indices:
+                # This was an interrupt tool call - process the decision
+                config = self.interrupt_on[tool_call["name"]]
+                decision = decisions[decision_idx]
+                decision_idx += 1
+
+                revised_tool_call, tool_message = self._process_decision(
+                    decision, tool_call, config
+                )
+                if revised_tool_call is not None:
+                    revised_tool_calls.append(revised_tool_call)
+                    if decision["type"] == "edit" and (edited_id := revised_tool_call.get("id")):
+                        edited_tool_calls[edited_id] = decision["edited_action"]
+                if tool_message:
+                    artificial_tool_messages.append(tool_message)
+            else:
+                # This was auto-approved - keep original
+                revised_tool_calls.append(tool_call)
+
+        # Update the AI message to only include approved tool calls
+        last_ai_msg.tool_calls = revised_tool_calls
+
+        # `wrap_tool_call` reads this back to substitute and annotate the call. Always
+        # written, so an earlier turn's edits cannot survive into this one.
+        return {
+            "messages": [last_ai_msg, *artificial_tool_messages],
+            _EDITED_TOOL_CALLS_KEY: edited_tool_calls,
+        }
+
+    async def aafter_model(
+        self, state: AgentState[Any], runtime: Runtime[ContextT]
+    ) -> dict[str, Any] | None:
+        """Async trigger interrupt flows for relevant tool calls after an `AIMessage`.
+
+        Args:
+            state: The current agent state.
+            runtime: The runtime context.
+
+        Returns:
+            Updated message with the revised tool calls.
+        """
+        return self.after_model(state, runtime)
+
+    def _reviewer_edit(self, request: ToolCallRequest) -> Action | None:
+        """The reviewer's replacement for this call, if an `edit` decision replaced it."""
+        tool_call_id = request.tool_call.get("id")
+        if not tool_call_id:
+            return None
+        edited = request.state.get(_EDITED_TOOL_CALLS_KEY) or {}
+        if tool_call_id in edited:
+            return cast("Action", edited[tool_call_id])
+        return None
+
+    def _apply_edit(self, request: ToolCallRequest, executed: Action) -> ToolCallRequest:
+        """Point the request at the reviewer's call, resolving a redirected tool.
+
+        Raises:
+            ValueError: If the reviewer named a tool the agent does not have.
+        """
+        tool_call: ToolCall = {
+            **request.tool_call,
+            "name": executed["name"],
+            "args": executed["args"],
+        }
+        if executed["name"] == request.tool_call["name"]:
+            return request.override(tool_call=tool_call)
+
+        # `tool_call["name"]` and `tool` must stay in agreement.
+        available = request.runtime.tools
+        tool = next((t for t in available if t.name == executed["name"]), None)
+        if tool is None:
+            names = ", ".join(sorted(t.name for t in available))
+            msg = (
+                f"Reviewer edited tool call {request.tool_call['id']!r} to "
+                f"{executed['name']!r}, which is not an available tool. "
+                f"Available tools: {names}."
+            )
+            raise ValueError(msg)
+        return request.override(tool_call=tool_call, tool=tool)
+
+    def _notice(self, executed: Action, *, has_content: bool) -> str:
+        """The notice text, stating the call that actually ran."""
+        notice = (
+            f"{self.edit_notice} Executed instead: {executed['name']} with arguments "
+            f"{json.dumps(executed['args'], default=str)}."
+        )
+        return f"{notice}\n\nTool response:" if has_content else notice
+
+    def _prepend_notice(self, message: ToolMessage, executed: Action) -> ToolMessage:
+        """Return `message` with the reviewer-edit notice prepended to its content."""
+        if not self.edit_notice:
+            return message
+        edit_notice = self._notice(executed, has_content=bool(message.content))
+
+        content: str | list[str | dict[Any, Any]]
+        if isinstance(message.content, str):
+            if edit_notice in message.content:
+                return message
+            separator = "\n" if message.content else ""
+            content = f"{edit_notice}{separator}{message.content}"
+        else:
+            if any(edit_notice in str(block) for block in message.content):
+                return message
+            # Match the surrounding block shape; providers may reject mixed lists.
+            notice: str | dict[Any, Any] = (
+                edit_notice
+                if message.content and all(isinstance(b, str) for b in message.content)
+                else {"type": "text", "text": edit_notice}
+            )
+            content = [notice, *message.content]
+
+        return message.model_copy(update={"content": content})
+
+    def _annotate_edited_result(
+        self,
+        result: ToolMessage | Command[Any],
+        request: ToolCallRequest,
+        executed: Action | None,
+    ) -> ToolMessage | Command[Any]:
+        """Tell the model a reviewer replaced the call, and with what."""
+        if not self.edit_notice or executed is None:
+            return result
+
+        if isinstance(result, ToolMessage):
+            return self._prepend_notice(result, executed)
+
+        # A `Command` carries the `ToolMessage` in its state update.
+        if not isinstance(result, Command) or not isinstance(result.update, dict):
+            return result
+        messages = result.update.get("messages")
+        if not isinstance(messages, list):
+            return result
+        tool_call_id = request.tool_call.get("id")
+        return replace(
+            result,
+            update={
+                **result.update,
+                "messages": [
+                    self._prepend_notice(message, executed)
+                    if isinstance(message, ToolMessage) and message.tool_call_id == tool_call_id
+                    else message
+                    for message in messages
+                ],
+            },
+        )
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        """Prepend reviewer-edit guidance to the result of an edited tool call.
+
+        Args:
+            request: The tool call request being executed.
+            handler: Callable that executes the tool.
+
+        Returns:
+            The tool result, with a note prepended when a reviewer edited the call.
+        """
+        executed = self._reviewer_edit(request)
+        if executed is not None:
+            request = self._apply_edit(request, executed)
+        return self._annotate_edited_result(handler(request), request, executed)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        """Async variant of `wrap_tool_call`.
+
+        Args:
+            request: The tool call request being executed.
+            handler: Awaitable callable that executes the tool.
+
+        Returns:
+            The tool result, with a note prepended when a reviewer edited the call.
+        """
+        executed = self._reviewer_edit(request)
+        if executed is not None:
+            request = self._apply_edit(request, executed)
+        return self._annotate_edited_result(await handler(request), request, executed)

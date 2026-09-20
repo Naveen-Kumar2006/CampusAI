@@ -1,0 +1,203 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+import faiss
+import re
+
+
+def get_code_size(d, indexkey):
+    """size of one vector in an index in dimension d
+    constructed with factory string indexkey"""
+
+    if indexkey == "Flat":
+        return d * 4
+
+    if indexkey.endswith(",RFlat"):
+        return d * 4 + get_code_size(d, indexkey[: -len(",RFlat")])
+
+    mo = re.match("IVF\\d+(_HNSW\\d+)?,(.*)$", indexkey)
+    if mo:
+        return get_code_size(d, mo.group(2))
+
+    mo = re.match("IVF\\d+\\(.*\\)?,(.*)$", indexkey)
+    if mo:
+        return get_code_size(d, mo.group(1))
+
+    mo = re.match("IMI\\d+x\\d+,(.*)$", indexkey)
+    if mo:
+        return get_code_size(d, mo.group(1))
+
+    mo = re.match("(.*),Refine\\((.*)\\)$", indexkey)
+    if mo:
+        return get_code_size(d, mo.group(1)) + get_code_size(d, mo.group(2))
+
+    mo = re.match("PQ(\\d+)x(\\d+)(fs|fsr)?$", indexkey)
+    if mo:
+        return (int(mo.group(1)) * int(mo.group(2)) + 7) // 8
+
+    mo = re.match("PQ(\\d+)\\+(\\d+)$", indexkey)
+    if mo:
+        return int(mo.group(1)) + int(mo.group(2))
+
+    mo = re.match("PQ(\\d+)$", indexkey)
+    if mo:
+        return int(mo.group(1))
+
+    mo = re.match("HNSW(\\d+)(,Flat)?$", indexkey)
+    if mo:
+        M = int(mo.group(1))
+        return d * 4 + M * 2 * 4  # roughly
+
+    mo = re.match("HNSW(\\d+),(.*)$", indexkey)
+    if mo:
+        M = int(mo.group(1))
+        return get_code_size(d, mo.group(2)) + M * 2 * 4  # roughly
+
+    if indexkey == "SQ8":
+        return d
+    elif indexkey == "SQ4":
+        return (d + 1) // 2
+    elif indexkey == "SQ6":
+        return (d * 6 + 7) // 8
+    elif indexkey == "SQfp16":
+        return d * 2
+    elif indexkey == "SQbf16":
+        return d * 2
+
+    mo = re.match("PCAR?(\\d+),(.*)$", indexkey)
+    if mo:
+        return get_code_size(int(mo.group(1)), mo.group(2))
+    mo = re.match("OPQ\\d+_(\\d+),(.*)$", indexkey)
+    if mo:
+        return get_code_size(int(mo.group(1)), mo.group(2))
+    mo = re.match("OPQ\\d+,(.*)$", indexkey)
+    if mo:
+        return get_code_size(d, mo.group(1))
+    mo = re.match("RR(\\d+),(.*)$", indexkey)
+    if mo:
+        return get_code_size(int(mo.group(1)), mo.group(2))
+    raise RuntimeError("cannot parse " + indexkey)
+
+
+def get_hnsw_M(index):
+    return index.hnsw.cum_nneighbor_per_level.at(1) // 2
+
+
+def reverse_index_factory(index):
+    """
+    attempts to get the factory string the index was built with
+    """
+    sq_names = {
+        faiss.ScalarQuantizer.QT_8bit: "SQ8",
+        faiss.ScalarQuantizer.QT_4bit: "SQ4",
+        # QT_8bit_uniform/QT_4bit_uniform have no index_factory string; these
+        # synthetic names are not round-trippable through index_factory.
+        faiss.ScalarQuantizer.QT_8bit_uniform: "SQ8u",
+        faiss.ScalarQuantizer.QT_4bit_uniform: "SQ4u",
+        faiss.ScalarQuantizer.QT_6bit: "SQ6",
+        faiss.ScalarQuantizer.QT_fp16: "SQfp16",
+        faiss.ScalarQuantizer.QT_bf16: "SQbf16",
+        faiss.ScalarQuantizer.QT_8bit_direct: "SQ8_direct",
+        faiss.ScalarQuantizer.QT_8bit_direct_signed: "SQ8_direct_signed",
+        # QT_0bit ("SQ0") is parsed by index_factory; for the IVF path.
+        faiss.ScalarQuantizer.QT_0bit: "SQ0",
+        faiss.ScalarQuantizer.QT_1bit_tqmse: "SQtqmse1",
+        faiss.ScalarQuantizer.QT_2bit_tqmse: "SQtqmse2",
+        faiss.ScalarQuantizer.QT_3bit_tqmse: "SQtqmse3",
+        faiss.ScalarQuantizer.QT_4bit_tqmse: "SQtqmse4",
+        faiss.ScalarQuantizer.QT_8bit_tqmse: "SQtqmse8",
+        faiss.ScalarQuantizer.QT_2bit_tq: "SQtq2",
+        faiss.ScalarQuantizer.QT_3bit_tq: "SQtq3",
+        faiss.ScalarQuantizer.QT_4bit_tq: "SQtq4",
+        faiss.ScalarQuantizer.QT_5bit_tq: "SQtq5",
+    }
+    index = faiss.downcast_index(index)
+    if isinstance(index, faiss.IndexFlat):
+        return "Flat"
+    elif isinstance(index, faiss.IndexIVF):
+        quantizer = faiss.downcast_index(index.quantizer)
+
+        if isinstance(quantizer, faiss.IndexFlat):
+            prefix = f"IVF{index.nlist}"
+        elif isinstance(quantizer, faiss.MultiIndexQuantizer):
+            prefix = f"IMI{quantizer.pq.M}x{quantizer.pq.nbits}"
+        elif isinstance(quantizer, faiss.IndexHNSW):
+            prefix = f"IVF{index.nlist}_HNSW{get_hnsw_M(quantizer)}"
+        else:
+            prefix = f"IVF{index.nlist}({reverse_index_factory(quantizer)})"
+
+        if isinstance(index, faiss.IndexIVFFlat):
+            return prefix + ",Flat"
+        if isinstance(index, faiss.IndexIVFScalarQuantizer):
+            return prefix + "," + sq_names[index.sq.qtype]
+        # IndexIVFPQR subclasses IndexIVFPQ, so it must be checked first.
+        if isinstance(index, faiss.IndexIVFPQR):
+            return prefix + f",PQ{index.pq.M}+{index.refine_pq.M}"
+        if isinstance(index, faiss.IndexIVFPQ):
+            return prefix + f",PQ{index.pq.M}x{index.pq.nbits}"
+        if isinstance(index, faiss.IndexIVFPQFastScan):
+            return prefix + f",PQ{index.pq.M}x{index.pq.nbits}fs"
+        if isinstance(index, faiss.IndexIVFRaBitQ):
+            nb_bits = index.rabitq.nb_bits
+            suffix = "RaBitQ" if nb_bits == 1 else f"RaBitQ{nb_bits}"
+            return prefix + "," + suffix
+
+    elif isinstance(index, faiss.IndexPreTransform):
+        if index.chain.size() != 1:
+            raise NotImplementedError()
+        vt = faiss.downcast_VectorTransform(index.chain.at(0))
+        if isinstance(vt, faiss.OPQMatrix):
+            prefix = f"OPQ{vt.M}_{vt.d_out}"
+        elif isinstance(vt, faiss.ITQTransform):
+            prefix = f"ITQ{vt.itq.d_out}"
+        elif isinstance(vt, faiss.PCAMatrix):
+            assert vt.eigen_power == 0
+            prefix = "PCA" + ("R" if vt.random_rotation else "") + str(vt.d_out)
+        else:
+            raise NotImplementedError()
+        return f"{prefix},{reverse_index_factory(index.index)}"
+
+    elif isinstance(index, faiss.IndexHNSW):
+        prefix = f"HNSW{get_hnsw_M(index)}"
+        storage = faiss.downcast_index(index.storage)
+        # flat storage is implicit in the bare HNSW<M> factory string
+        if storage is None or isinstance(storage, faiss.IndexFlat):
+            return prefix
+        return f"{prefix},{reverse_index_factory(storage)}"
+
+    elif isinstance(index, faiss.IndexRefine):
+        return (
+            f"{reverse_index_factory(index.base_index)},"
+            f"Refine({reverse_index_factory(index.refine_index)})"
+        )
+
+    elif isinstance(index, faiss.IndexPQFastScan):
+        return f"PQ{index.pq.M}x{index.pq.nbits}fs"
+
+    elif isinstance(index, faiss.IndexPQ):
+        return f"PQ{index.pq.M}x{index.pq.nbits}"
+
+    elif isinstance(index, faiss.IndexLSH):
+        return (
+            "LSH"
+            + ("r" if index.rotate_data else "")
+            + ("t" if index.train_thresholds else "")
+        )
+
+    elif isinstance(index, faiss.IndexScalarQuantizer):
+        return sq_names[index.sq.qtype]
+
+    elif isinstance(index, faiss.IndexRaBitQ):
+        nb_bits = index.rabitq.nb_bits
+        return "RaBitQ" if nb_bits == 1 else f"RaBitQ{nb_bits}"
+
+    # IndexIDMap2 is a subclass of IndexIDMap, so it must be checked first.
+    elif isinstance(index, faiss.IndexIDMap2):
+        return f"IDMap2,{reverse_index_factory(index.index)}"
+
+    elif isinstance(index, faiss.IndexIDMap):
+        return f"IDMap,{reverse_index_factory(index.index)}"
+
+    raise NotImplementedError()
