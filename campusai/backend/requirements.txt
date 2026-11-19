@@ -1,5 +1,19 @@
-fastapi
-uvicorn
-sqlalchemy
-pydantic
-python-dotenv
+# FastAPI Backend
+fastapi==0.141.1
+uvicorn==0.53.0
+pydantic==2.13.5
+python-dotenv==1.2.3
+
+# Database – SQLite
+sqlalchemy==2.0.54
+
+# LangChain & Ollama Integration
+langchain==1.4.2
+langchain-core==1.6.3
+langchain-community==0.4.2
+langchain-ollama==1.1.0
+langchain-text-splitters==1.1.2
+
+# Vector Search & Document Ingestion
+faiss-cpu==1.15.1
+pypdf==6.19.0

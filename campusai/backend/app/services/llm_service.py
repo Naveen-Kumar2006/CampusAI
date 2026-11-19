@@ -1,21 +1,10 @@
-import os
-
-from dotenv import load_dotenv
-from google import genai
-
-load_dotenv()
+from langchain_ollama import ChatOllama
 
 
-API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-
-if not API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not configured")
-
-
-client = genai.Client(api_key=API_KEY)
-
-
+llm=ChatOllama(
+    model="qwen3:8b-q4_K_M",
+    temperature=0.2,
+)
 def generate_answer(question: str, context: str) -> str:
 
     prompt = f"""
@@ -39,9 +28,5 @@ Rules:
 5. Do not mention that you are an AI unless necessary.
 """
 
-    interaction = client.interactions.create(
-        model=MODEL_NAME,
-        input=prompt
-    )
-
-    return interaction.output_text
+    response = llm.invoke(prompt)
+    return response.content.strip()

@@ -33,7 +33,7 @@ def get_college_info():
     return {
         "name": "CampusAI Institute of Engineering",
         "location": "Tamil Nadu, India",
-        "established": 2001,
+        "established": 2099,
         "description": (
             "Empowering the Engineers of Tomorrow "
             "with cutting-edge technology and research."
@@ -53,13 +53,7 @@ class ChatRequest(BaseModel):
 
 @app.post("/api/chat")
 def chat(request: ChatRequest):
-    """
-    Answer questions using college documents,
-    FAISS retrieval, and Gemini.
-    """
-
     message = request.message.strip()
-
     if not message:
         raise HTTPException(
             status_code=400,

@@ -1,32 +1,48 @@
-# React + TypeScript + Vite
+# CampusAI — Frontend Portal
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The client-side web application for CampusAI, built with React 19, TypeScript, Vite, and Tailwind CSS v4.
 
-Currently, two official plugins are available:
+## Features
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- **College Portal UI**: Responsive interface showcasing departments, announcements, upcoming events, and academics.
+- **RAG Chatbot Assistant**: Embedded conversational interface interacting with the FastAPI backend (`/api/chat`).
+- **Styling**: Modern, responsive design powered by Tailwind CSS v4.
+- **Routing**: Client-side navigation handled by React Router v7.
 
-## React Compiler
+## Tech Stack
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- **React 19** + **TypeScript**
+- **Vite 8**
+- **Tailwind CSS v4** + **PostCSS**
+- **Lucide React** (icons)
+- **React Router DOM v7**
 
-## Expanding the Oxlint configuration
+## Getting Started
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+### 1. Install Dependencies
 
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm install
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+### 2. Run Development Server
+
+```bash
+npm run dev
+```
+
+The application will start at `http://localhost:5173`. Ensure the FastAPI backend is running at `http://localhost:8000`.
+
+### 3. Build for Production
+
+```bash
+npm run build
+```
+
+This compiles TypeScript (`tsc -b`) and bundles production assets into the `dist/` directory using Vite.
+
+### 4. Preview Production Build
+
+```bash
+npm run preview
+```
